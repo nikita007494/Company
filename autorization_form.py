@@ -4,15 +4,28 @@ import hashlib
 from datetime import datetime
 import json
 import os
-
+from captcha import CaptchaWindow
+# Импортируем класс из второго файла
+import main_form
+from main_form import MainApplication
+import registration
+from database import DatabaseConnection
+from text_captcha import TextImageCaptcha
 class EnhancedLoginWindow:
     def __init__(self):
         self.window = tk.Tk()
         self.window.title("🔐 Торговая платформа - Авторизация")
-        self.window.geometry("560x700")
+        self.window.geometry("560x800")
         self.window.configure(bg='#f0f2f5')
         self.window.resizable(False, False)
+        self.locked_until = None
+        # Флаг прохождения капчи
+        #self.captcha_passed = False
         
+         # Счетчик неудачных попыток и флаг капчи
+        self.failed_attempts = 0
+        self.max_attempts = 0  # Максимальное количество попыток до капчи
+        #self.captcha_passed = False
         # Иконка (если есть файл icon.ico)
         try:
             self.window.iconbitmap('icon.ico')
@@ -39,6 +52,9 @@ class EnhancedLoginWindow:
         
         # Тестовые пользователи
         self.users = self.load_users()
+        
+        # ID таймера для отмены
+        self.timer_id = None
         
         # Создаем интерфейс
         self.create_interface()
@@ -196,9 +212,13 @@ class EnhancedLoginWindow:
     
     def update_time(self):
         """Обновление времени в реальном времени"""
-        current_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        self.time_label.config(text=current_time)
-        self.window.after(1000, self.update_time)
+        try:
+            current_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            self.time_label.config(text=current_time)
+            # Сохраняем ID таймера для отмены
+            self.timer_id = self.window.after(1000, self.update_time)
+        except Exception as e:
+            print(f"Ошибка обновления времени: {e}")
     
     def create_login_card(self, parent):
         """Создание карточки входа"""
@@ -291,7 +311,19 @@ class EnhancedLoginWindow:
                                   pady=12,
                                   command=self.login)
         self.login_btn.pack(fill='x', pady=(0, 15))
-        
+
+        self.regist_btn = tk.Button(card_body,
+                                  text="РЕГИСТРАЦИЯ",
+                                  font=('Segoe UI', 11, 'bold'),
+                                  bg=self.colors['secondary'],
+                                  fg='white',
+                                  relief='flat',
+                                  cursor='hand2',
+                                  padx=30,
+                                  pady=12,
+                                  command=self.show_registration
+                                  )
+        self.regist_btn.pack(fill='x', pady=(0, 15))
         # Дополнительные опции
         options_frame = tk.Frame(card_body, bg='white')
         options_frame.pack(fill='x')
@@ -501,26 +533,134 @@ class EnhancedLoginWindow:
         return True
     
     def login(self):
-        """Обработка входа"""
+        """Обработка входа с капчей"""
         if not self.validate_input():
             return
-        
+    
         username = self.username_var.get().strip()
         password = self.password_entry.get().strip()
-        hashed_password = self.hash_password(password)
-        
-        # Проверка учетных данных
-        if username in self.users and self.users[username]['password'] == hashed_password:
-            # Успешный вход
-            self.on_login_success(username)
-        else:
-            # Неудачная попытка
-            self.on_login_failure(username)
     
-    def on_login_success(self, username):
-        """Действия при успешном входе"""
-        user_data = self.users[username]
+        # ВСЕГДА показываем капчу
+        self.show_captcha_window()
+    
+        # Сначала пробуем БД
+        try:
+            from database import DatabaseConnection
+            db = DatabaseConnection.get_instance()
+    
+            print(f"DEBUG: Пробуем аутентификацию через БД для {username}")
+            success, message, user_data = db.authenticate_user(username, password)
+    
+            if success:
+                print(f"DEBUG: Успешная аутентификация через БД")
+                # Сбрасываем счетчик неудачных попыток при успешном входе
+                self.failed_attempts = 0
+                self.captcha_passed = False
+            
+                # Обновляем статус капчи
+                if hasattr(self, 'update_captcha_status'):
+                    self.update_captcha_status()
+            
+                # Проверяем, есть ли метод on_login_success
+                if hasattr(self, 'on_login_success'):
+                    print(f"DEBUG: Вызываем on_login_success с user_data")
+                    self.on_login_success(username, user_data)
+                else:
+                    print(f"ERROR: Метод on_login_success не найден!")
+                    messagebox.showerror("Ошибка", "Метод on_login_success не найден в классе")
+                return
+            else:
+                print(f"DEBUG: Ошибка аутентификации в БД: {message}")
+                # Увеличиваем счетчик неудачных попыток
+                self.failed_attempts += 1
+            
+                # Обновляем статус капчи
+                if hasattr(self, 'update_captcha_status'):
+                    self.update_captcha_status()
+            
+                # Проверяем, нужна ли капча после неудачной попытки
+                if self.failed_attempts >= self.max_attempts:
+                    self.show_captcha_required()
+            
+                # Проверяем, есть ли метод on_login_failure
+                if hasattr(self, 'on_login_failure'):
+                    self.on_login_failure(username)
+                else:
+                    print(f"ERROR: Метод on_login_failure не найден!")
+                    messagebox.showerror("Ошибка", f"Неверные данные: {message}")
+                return
         
+        except AttributeError as e:
+            print(f"DEBUG: AttributeError - проверяем наличие методов: {e}")
+            # Проверяем наличие методов
+            methods = ['on_login_success', 'on_login_failure', 'hash_password']
+            for method in methods:
+                if not hasattr(self, method):
+                    print(f"ERROR: Отсутствует метод {method}")
+    
+            # Fallback на локальные данные
+            print("DEBUG: Используем fallback...")
+    
+        except Exception as e:
+            print(f"DEBUG: Ошибка подключения к БД: {e}")
+            # Увеличиваем счетчик неудачных попыток
+            self.failed_attempts += 1
+        
+            # Обновляем статус капчи
+            if hasattr(self, 'update_captcha_status'):
+                self.update_captcha_status()
+        
+            # Fallback на локальные данные
+            pass
+    
+        # Fallback на локальные данные (если БД недоступна или ошибка)
+        print(f"DEBUG: Используем локальные данные...")
+        hashed_password = self.hash_password(password)
+    
+        if username in self.users and self.users[username]['password'] == hashed_password:
+            # Сбрасываем счетчик неудачных попыток при успешном входе
+            self.failed_attempts = 0
+            self.captcha_passed = False
+        
+            # Обновляем статус капчи
+            if hasattr(self, 'update_captcha_status'):
+                self.update_captcha_status()
+        
+            # Создаем user_data из локальных данных
+            user_data = self.users[username]
+    
+            if hasattr(self, 'on_login_success'):
+                self.on_login_success(username, user_data)
+            else:
+                print("ERROR: Метод on_login_success не найден для локальных данных!")
+                messagebox.showerror("Ошибка", "Внутренняя ошибка приложения")
+        else:
+            # Увеличиваем счетчик неудачных попыток
+            self.failed_attempts += 1
+        
+            # Обновляем статус капчи
+            if hasattr(self, 'update_captcha_status'):
+                self.update_captcha_status()
+        
+            # Проверяем, нужна ли капча после неудачной попытки
+            if self.failed_attempts >= self.max_attempts:
+                self.show_captcha_required()
+        
+            if hasattr(self, 'on_login_failure'):
+                self.on_login_failure(username)
+            else:
+                messagebox.showerror("Ошибка авторизации", 
+                           "Неверное имя пользователя или пароль")
+    def on_login_success(self, username, user_data=None):
+        """Действия при успешном входе"""
+        # Если user_data не передан, используем локальные данные
+        if user_data is None and username in self.users:
+         user_data = self.users[username]
+    
+        if not user_data:
+            messagebox.showerror("Ошибка", "Данные пользователя не найдены")
+            return
+    
         # Сохраняем конфигурацию
         if self.remember_var.get():
             self.config['last_username'] = username
@@ -528,54 +668,219 @@ class EnhancedLoginWindow:
         else:
             self.config['last_username'] = ''
             self.config['remember_me'] = False
-        
+    
         # Сбрасываем счетчик попыток
         if username in self.config.get('login_attempts', {}):
             del self.config['login_attempts'][username]
-        
+       
         self.save_config()
-        
+    
         # Показываем сообщение
         role_name = self.get_role_name(user_data['role'])
         messagebox.showinfo("Вход выполнен",
-                          f"✅ Успешная авторизация!\n\n"
-                          f"Добро пожаловать, {user_data['name']}!\n"
-                          f"Роль: {role_name}\n"
-                          f"Логин: {username}")
-        
-        # Закрываем окно авторизации и открываем главное
+                       f"✅ Успешная авторизация!\n\n"
+                       f"Добро пожаловать, {user_data['name']}!\n"
+                       f"Роль: {role_name}\n"
+                       f"Логин: {username}")
+    
+        #    Останавливаем таймер перед уничтожением окна
+        if hasattr(self, 'timer_id') and self.timer_id:
+            self.window.after_cancel(self.timer_id)
+    
+        # Закрываем окно авторизации
         self.window.destroy()
-        
-        # Здесь будет запуск главного приложения
+    
+        # Запускаем главное приложение
         self.launch_main_app(username, user_data)
+    def update_captcha_status(self):
+        """Обновление статуса капчи"""
+        if self.failed_attempts >= self.max_attempts and not self.captcha_passed:
+            self.captcha_status_label.config(
+                text=f"Требуется проверка капчи ({self.failed_attempts}/{self.max_attempts} попыток)"
+            )
+        else:
+            self.captcha_status_label.config(text="")
+    
+ 
+    def show_registration(self):
+        """Показать форму регистрации"""
+        # Создаем окно регистрации как дочернее
+        registration_window = registration.RegistrationForm(self.window)
+
+    def show_captcha_required(self):
+        """Показ сообщения о необходимости капчи"""
+        if self.failed_attempts >= self.max_attempts and not self.captcha_passed:
+            response = messagebox.askyesno(
+                "Требуется проверка безопасности",
+                #f"Обнаружено {self.failed_attempts} неудачных попыток входа.\n"
+                "Для продолжения требуется пройти проверку.\n\n"
+                "Пройти проверку сейчас?"
+            )
+        
+            if response:
+                self.show_captcha_window()
+                return True
+        return False
+    def show_captcha_window(self):
+        """Показать окно текстовой капчи"""
+        try:
+            from text_captcha import TextImageCaptcha
+        
+            def on_captcha_success():
+                """Обработка успешного прохождения капчи"""
+                self.captcha_passed = True
+                self.update_captcha_status()
+                messagebox.showinfo("Успех", 
+                              "✓ Проверка пройдена успешно!\n"
+                              "Теперь вы можете попробовать войти снова.")
+        
+            # Открываем окно текстовой капчи
+            TextImageCaptcha(self.window, on_captcha_success)
+        
+        except ImportError as e:
+            print(f"❌ Не удалось импортировать текстовую капчу: {e}")
+            # Fallback на простую математическую капчу
+            self.show_simple_captcha()
+
+    def show_simple_captcha(self):
+        """Простая текстовая капча (fallback)"""
+        import random
+    
+        # Создаем окно капчи
+        captcha_window = tk.Toplevel(self.window)
+        captcha_window.title("Проверка безопасности")
+        captcha_window.geometry("400x300")
+        captcha_window.configure(bg='white')
+        captcha_window.resizable(False, False)
+    
+        # Блокируем родительское окно
+        captcha_window.transient(self.window)
+        captcha_window.grab_set()
+    
+        # Генерируем случайный пример
+        operations = ['+', '-', '*']
+        a = random.randint(1, 10)
+        b = random.randint(1, 10)
+        op = random.choice(operations)
+    
+        if op == '+':
+            correct_answer = a + b
+        elif op == '-':
+            correct_answer = a - b
+        else:
+            correct_answer = a * b
+    
+        # Интерфейс
+        # Центрирование окна (самый простой способ)
+        captcha_window.update_idletasks()
+        width = captcha_window.winfo_width()
+        height = captcha_window.winfo_height()
+        x = (captcha_window.winfo_screenwidth() // 2) - (width // 2)
+        y = (captcha_window.winfo_screenheight() // 2) - (height // 2)
+        captcha_window.geometry(f'+{x}+{y}')
+        main_frame = tk.Frame(captcha_window, bg='white', padx=30, pady=30)
+        main_frame.pack(fill='both', expand=True)
+    
+        tk.Label(main_frame,
+             text="🔒 ПРОВЕРКА БЕЗОПАСНОСТИ",
+             font=('Arial', 14, 'bold'),
+             fg='#2c3e50',
+             bg='white').pack(pady=(0, 20))
+    
+        tk.Label(main_frame,
+             text=f"Решите пример: {a} {op} {b} = ?",
+             font=('Arial', 16),
+             fg='#34495e',
+             bg='white').pack(pady=(0, 20))
+    
+        answer_var = tk.StringVar()
+        ttk.Entry(main_frame, textvariable=answer_var, 
+              font=('Arial', 14)).pack(pady=(0, 20), fill='x')
+    
+        def verify():
+            try:
+                user_answer = int(answer_var.get().strip())
+                if user_answer == correct_answer:
+                    self.captcha_passed = True
+                    self.update_captcha_status()
+                    messagebox.showinfo("Успех", "Проверка пройдена!")
+                    captcha_window.destroy()
+                else:
+                    messagebox.showerror("Ошибка", "Неверный ответ!")
+                    answer_var.set("")
+            except:
+                messagebox.showerror("Ошибка", "Введите число!")
+    
+        tk.Button(main_frame,
+                text="ПРОВЕРИТЬ",
+                bg='#27ae60',
+                fg='white',
+                font=('Arial', 12, 'bold'),
+                command=verify,
+                padx=30, pady=10).pack()
+
+    def update_captcha_status(self):
+        """Обновление статуса капчи в интерфейсе"""
+        if hasattr(self, 'captcha_status_label'):
+            if self.failed_attempts >= self.max_attempts and not self.captcha_passed:
+                self.captcha_status_label.config(
+                    text=f"⚠️ Требуется проверка ({self.failed_attempts}/{self.max_attempts})",
+                    fg='#e74c3c'
+                )
+            elif self.captcha_passed:
+                self.captcha_status_label.config(
+                    text="✓ Проверка пройдена",
+                    fg='#27ae60'
+                )
+            else:
+                remaining = max(0, self.max_attempts - self.failed_attempts)
+                self.captcha_status_label.config(
+                    text=f"Осталось попыток: {remaining}",
+                    fg='#7f8c8d'
+                )
+    def increment_failed_attempts(self):
+        """Увеличивает счетчик неудачных попыток"""
+        self.failed_attempts += 1
+        self.update_captcha_status()
+    
+        # Проверяем, нужна ли капча
+        if self.failed_attempts >= self.max_attempts and not self.captcha_passed:
+            self.show_captcha_required()
+
+    def reset_login_attempts(self):
+        """Сбрасывает счетчик попыток при успешном входе"""
+        self.failed_attempts = 0
+        self.captcha_passed = False
+        self.update_captcha_status()
+
     
     def on_login_failure(self, username):
         """Действия при неудачном входе"""
         # Увеличиваем счетчик попыток
         if 'login_attempts' not in self.config:
-            self.config['login_attempts'] = {}
-        
+         self.config['login_attempts'] = {}
+    
         self.config['login_attempts'][username] = self.config['login_attempts'].get(username, 0) + 1
         self.save_config()
-        
+    
         attempts = self.config['login_attempts'][username]
         remaining = 5 - attempts
-        
+    
         if remaining > 0:
-            messagebox.showerror("Ошибка авторизации",
-                               f"❌ Неверное имя пользователя или пароль\n\n"
-                               f"Неудачных попыток: {attempts}\n"
-                               f"Осталось попыток: {remaining}")
+         messagebox.showerror("Ошибка авторизации",
+                           f"❌ Неверное имя пользователя или пароль\n\n"
+                           f"Неудачных попыток: {attempts}\n"
+                           f"Осталось попыток: {remaining}")
         else:
             messagebox.showerror("Доступ заблокирован",
-                               f"❌ Превышено максимальное количество попыток\n\n"
-                               f"Доступ для пользователя '{username}' временно заблокирован.\n"
-                               "Обратитесь к системному администратору.")
-        
+                           f"❌ Превышено максимальное количество попыток\n\n"
+                           f"Доступ для пользователя '{username}' временно заблокирован.\n"
+                           "Обратитесь к системному администратору.")
+    
         # Сброс пароля и фокус
         self.password_entry.delete(0, tk.END)
         self.password_entry.focus_set()
-        
+    
         # Анимация тряски
         self.shake_window()
     
@@ -583,13 +888,13 @@ class EnhancedLoginWindow:
         """Анимация тряски окна при ошибке"""
         x = self.window.winfo_x()
         y = self.window.winfo_y()
-        
+    
         for i in range(5):
             offset = 5 if i % 2 == 0 else -5
             self.window.geometry(f"+{x + offset}+{y}")
             self.window.update()
             self.window.after(50)
-        
+    
         self.window.geometry(f"+{x}+{y}")
     
     def get_role_name(self, role):
@@ -605,400 +910,20 @@ class EnhancedLoginWindow:
     
     def launch_main_app(self, username, user_data):
         """Запуск главного приложения"""
-        # Импортируем здесь, чтобы избежать циклических импортов
-        import sys
-        
-        # Создаем простое главное окно для демонстрации
-        main_window = tk.Tk()
-        main_window.title(f"Торговая платформа - {self.get_role_name(user_data['role'])}")
-        main_window.geometry("900x600")
-        main_window.configure(bg='white')
-        
-        # Центрируем
-        main_window.update_idletasks()
-        width = main_window.winfo_width()
-        height = main_window.winfo_height()
-        x = (main_window.winfo_screenwidth() // 2) - (width // 2)
-        y = (main_window.winfo_screenheight() // 2) - (height // 2)
-        main_window.geometry(f'{width}x{height}+{x}+{y}')
-        
-        # Создаем интерфейс главного окна
-        self.create_main_interface(main_window, username, user_data)
-        
-        main_window.mainloop()
+        # Создаем экземпляр главного приложения
+        main_app = MainApplication(username, user_data, self.colors)
+        main_app.run()
     
-    def create_main_interface(self, window, username, user_data):
-        """Создание интерфейса главного окна"""
-        # Верхняя панель
-        header = tk.Frame(window, bg=self.colors['primary'], height=70)
-        header.pack(fill='x')
-        header.pack_propagate(False)
-        
-        # Лого и название
-        logo_frame = tk.Frame(header, bg=self.colors['primary'])
-        logo_frame.pack(side='left', padx=20)
-        
-        tk.Label(logo_frame,
-                text="🛒",
-                font=('Segoe UI', 24),
-                bg=self.colors['primary'],
-                fg='white').pack(side='left', padx=(0, 10))
-        
-        tk.Label(logo_frame,
-                text="Торговая платформа",
-                font=('Segoe UI', 16, 'bold'),
-                bg=self.colors['primary'],
-                fg='white').pack(side='left')
-        
-        # Информация о пользователе
-        user_frame = tk.Frame(header, bg=self.colors['primary'])
-        user_frame.pack(side='right', padx=20)
-        
-        tk.Label(user_frame,
-                text=f"{user_data['name']}",
-                font=('Segoe UI', 11),
-                bg=self.colors['primary'],
-                fg='white').pack(side='top', anchor='e')
-        
-        tk.Label(user_frame,
-                text=f"Роль: {self.get_role_name(user_data['role'])}",
-                font=('Segoe UI', 9),
-                bg=self.colors['primary'],
-                fg='#bdc3c7').pack(side='bottom', anchor='e')
-        
-        # Основной контент
-        content = tk.Frame(window, bg='white')
-        content.pack(fill='both', expand=True, padx=20, pady=20)
-        
-        # Приветствие
-        welcome_frame = tk.Frame(content, bg='white')
-        welcome_frame.pack(fill='x', pady=(0, 30))
-        
-        tk.Label(welcome_frame,
-                text=f"Добро пожаловать, {user_data['name']}!",
-                font=('Segoe UI', 20, 'bold'),
-                fg=self.colors['primary'],
-                bg='white').pack(anchor='w')
-        
-        tk.Label(welcome_frame,
-                text="Вы вошли в систему управления торговой платформой",
-                font=('Segoe UI', 12),
-                fg=self.colors['gray'],
-                bg='white').pack(anchor='w', pady=(5, 0))
-        
-        # Доступные функции в зависимости от роли
-        self.show_role_functions(content, user_data['role'])
-        
-        # Кнопка выхода
-        tk.Button(content,
-                 text="Выйти из системы",
-                 font=('Segoe UI', 10, 'bold'),
-                 bg=self.colors['accent'],
-                 fg='white',
-                 relief='flat',
-                 padx=30,
-                 pady=10,
-                 cursor='hand2',
-                 command=window.destroy).pack(side='bottom', pady=20)
-    
-def show_role_functions(self, parent, role):
-    """Показать функции доступные для роли в виде кнопок с иконками"""
-    
-    # Функции с подробным описанием
-    role_functions = {
-        'candidate': [
-            ("📝", "Резюме", "Заполнение и редактирование резюме", self.open_resume_section),
-            ("👁‍🗨", "Вакансии", "Просмотр активных вакансий компании", self.open_vacancies_section),
-            ("📊", "Статус", "Отслеживание статуса своей анкеты", self.open_application_status),
-            ("🔔", "Уведомления", "Уведомления о новых вакансиях", self.open_notifications),
-            ("📄", "Документы", "Мои загруженные документы", self.open_documents)
-        ],
-        # ... остальные роли ...
-    }
-    
-    functions = role_functions.get(role, [])
-    
-    # Создаем основной фрейм
-    main_frame = tk.Frame(parent, bg='white')
-    main_frame.pack(fill='both', expand=True)
-    
-    # Заголовок
-    header_frame = tk.Frame(main_frame, bg='white')
-    header_frame.pack(fill='x', pady=(0, 20))
-    
-    tk.Label(header_frame,
-            text="🚀 ДОСТУПНЫЕ РАЗДЕЛЫ",
-            font=('Segoe UI', 16, 'bold'),
-            fg=self.colors['primary'],
-            bg='white').pack(anchor='w')
-    
-    tk.Label(header_frame,
-            text="Выберите нужный раздел для работы",
-            font=('Segoe UI', 11),
-            fg=self.colors['gray'],
-            bg='white').pack(anchor='w', pady=(5, 0))
-    
-    if not functions:
-        tk.Label(main_frame,
-                text="Нет доступных функций для данной роли",
-                font=('Segoe UI', 12),
-                fg=self.colors['gray'],
-                bg='white').pack(pady=50)
-        return
-    
-    # Создаем Canvas для прокрутки
-    canvas = tk.Canvas(main_frame, bg='white', highlightthickness=0)
-    scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-    
-    scrollable_frame = tk.Frame(canvas, bg='white')
-    scrollable_frame.bind(
-        "<Configure>",
-        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
-    
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
-    
-    # Сетка для кнопок
-    grid_frame = tk.Frame(scrollable_frame, bg='white')
-    grid_frame.pack(fill='both', expand=True, padx=5, pady=5)
-    
-    # Создаем стилизованные кнопки
-    for i, (icon, title, description, command) in enumerate(functions):
-        row = i // 2
-        col = i % 2
-        
-        btn_frame = tk.Frame(grid_frame, 
-                            bg=self.get_button_color(role),
-                            relief='flat',
-                            highlightthickness=0)
-        btn_frame.grid(row=row, column=col, padx=10, pady=10, sticky='nsew')
-        
-        # Внутренний фрейм для отступов
-        inner_frame = tk.Frame(btn_frame, bg='white', padx=15, pady=15)
-        inner_frame.pack(fill='both', expand=True)
-        
-        # Иконка и заголовок
-        icon_frame = tk.Frame(inner_frame, bg='white')
-        icon_frame.pack(fill='x', pady=(0, 10))
-        
-        tk.Label(icon_frame,
-                text=icon,
-                font=('Segoe UI', 24),
-                bg='white').pack(side='left', padx=(0, 10))
-        
-        tk.Label(icon_frame,
-                text=title,
-                font=('Segoe UI', 13, 'bold'),
-                fg=self.colors['primary'],
-                bg='white').pack(side='left')
-        
-        # Описание
-        tk.Label(inner_frame,
-                text=description,
-                font=('Segoe UI', 10),
-                fg=self.colors['dark'],
-                bg='white',
-                wraplength=200,
-                justify='left').pack(fill='x', pady=(0, 15))
-        
-        # Кнопка "Открыть"
-        open_btn = tk.Button(inner_frame,
-                           text="ОТКРЫТЬ →",
-                           font=('Segoe UI', 9, 'bold'),
-                           bg=self.get_button_color(role),
-                           fg='white',
-                           relief='flat',
-                           cursor='hand2',
-                           padx=20,
-                           pady=6,
-                           command=command)
-        open_btn.pack()
-        
-        # Эффект наведения на всю карточку
-        self.add_card_hover_effect(btn_frame, inner_frame, open_btn, role)
-        
-        # Настраиваем размеры
-        btn_frame.config(width=250, height=180)
-        btn_frame.pack_propagate(False)
-    
-    # Настройка сетки
-    grid_frame.columnconfigure(0, weight=1)
-    grid_frame.columnconfigure(1, weight=1)
-    
-    # Размещаем Canvas и Scrollbar
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-    
-    # Настраиваем прокрутку колесиком мыши
-    def on_mousewheel(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    
-    canvas.bind_all("<MouseWheel>", on_mousewheel)
-    
-    def open_resume_section(self):
-        """Заглушка для раздела резюме"""
-        messagebox.showinfo("Резюме", "Раздел 'Резюме' в разработке")
-    
-    def open_vacancies_section(self):
-        """Заглушка для раздела вакансий"""
-        messagebox.showinfo("Вакансии", "Раздел 'Вакансии' в разработке")
-    
-    def open_application_status(self):
-        """Заглушка для раздела статуса анкеты"""
-        messagebox.showinfo("Статус анкеты", "Раздел 'Статус анкеты' в разработке")
-    
-    def open_notifications(self):
-        """Заглушка для раздела уведомлений"""
-        messagebox.showinfo("Уведомления", "Раздел 'Уведомления' в разработке")
-    
-    def open_documents(self):
-        """Заглушка для раздела документов"""
-        messagebox.showinfo("Документы", "Раздел 'Документы' в разработке")
-    
-    def open_catalog(self):
-        """Заглушка для раздела каталога"""
-        messagebox.showinfo("Каталог", "Раздел 'Каталог' в разработке")
-    
-    def open_contract_application(self):
-        """Заглушка для раздела контракта"""
-        messagebox.showinfo("Контракт", "Раздел 'Контракт' в разработке")
-    
-    def create_order(self):
-        """Заглушка для создания заказа"""
-        messagebox.showinfo("Создание заказа", "Раздел 'Создание заказа' в разработке")
-    
-    def track_orders(self):
-        """Заглушка для отслеживания заказов"""
-        messagebox.showinfo("Отслеживание", "Раздел 'Отслеживание заказов' в разработке")
-    
-    def order_history(self):
-        """Заглушка для истории заказов"""
-        messagebox.showinfo("История", "Раздел 'История заказов' в разработке")
-    
-    def payment_section(self):
-        """Заглушка для раздела оплаты"""
-        messagebox.showinfo("Оплата", "Раздел 'Оплата' в разработке")
-    
-    def open_clients(self):
-        """Заглушка для раздела клиентов"""
-        messagebox.showinfo("Клиенты", "Раздел 'Клиенты' в разработке")
-    
-    def manage_orders(self):
-        """Заглушка для управления заказами"""
-        messagebox.showinfo("Управление заказами", "Раздел 'Управление заказами' в разработке")
-    
-    def schedule_section(self):
-        """Заглушка для раздела графика"""
-        messagebox.showinfo("График", "Раздел 'График вывоза' в разработке")
-    
-    def client_contracts(self):
-        """Заглушка для контрактов клиентов"""
-        messagebox.showinfo("Контракты", "Раздел 'Контракты клиентов' в разработке")
-    
-    def sales_statistics(self):
-        """Заглушка для статистики"""
-        messagebox.showinfo("Статистика", "Раздел 'Статистика' в разработке")
-    
-    def new_deal(self):
-        """Заглушка для новой сделки"""
-        messagebox.showinfo("Сделка", "Раздел 'Новая сделка' в разработке")
-    
-    def today_orders(self):
-        """Заглушка для заказов на сегодня"""
-        messagebox.showinfo("Заказы", "Раздел 'Заказы на сегодня' в разработке")
-    
-    def change_order_status(self):
-        """Заглушка для изменения статуса"""
-        messagebox.showinfo("Статус заказа", "Раздел 'Изменение статуса заказа' в разработке")
-    
-    def delivery_schedule(self):
-        """Заглушка для графика доставки"""
-        messagebox.showinfo("Доставка", "Раздел 'График доставки' в разработке")
-    
-    def shipment_readiness(self):
-        """Заглушка для готовности к отгрузке"""
-        messagebox.showinfo("Отгрузка", "Раздел 'Готовность к отгрузке' в разработке")
-    
-    def logistics_reports(self):
-        """Заглушка для логистических отчетов"""
-        messagebox.showinfo("Отчеты", "Раздел 'Логистические отчеты' в разработке")
-    
-    def delivery_routes(self):
-        """Заглушка для маршрутов доставки"""
-        messagebox.showinfo("Маршруты", "Раздел 'Маршруты доставки' в разработке")
-    
-    def manage_products(self):
-        """Заглушка для управления товарами"""
-        messagebox.showinfo("Товары", "Раздел 'Управление товарами' в разработке")
-    
-    def manage_users(self):
-        """Заглушка для управления пользователями"""
-        messagebox.showinfo("Пользователи", "Раздел 'Управление пользователями' в разработке")
-    
-    def system_settings(self):
-        """Заглушка для настроек системы"""
-        messagebox.showinfo("Настройки", "Раздел 'Настройки системы' в разработке")
-    
-    def analytics_reports(self):
-        """Заглушка для аналитики"""
-        messagebox.showinfo("Аналитика", "Раздел 'Аналитика' в разработке")
-    
-    def tech_support(self):
-        """Заглушка для техподдержки"""
-        messagebox.showinfo("Поддержка", "Раздел 'Техническая поддержка' в разработке")
-    
-    def system_logs(self):
-        """Заглушка для логов системы"""
-        messagebox.showinfo("Логи", "Раздел 'Логи системы' в разработке")
-    
-    def finance_management(self):
-        """Заглушка для управления финансами"""
-        messagebox.showinfo("Финансы", "Раздел 'Управление финансами' в разработке")
-    
-    
-def get_button_color(self, role):
-     """Возвращает цвет кнопки в зависимости от роли"""
-     colors = {
-        'candidate': '#3498db',      # Синий
-        'consumer': '#2ecc71',       # Зеленый
-        'agent': '#9b59b6',          # Фиолетовый
-        'logistic': '#e67e22',       # Оранжевый
-        'admin': '#e74c3c'           # Красный
-     }
-     return colors.get(role, '#3498db')
+    def run(self):
+        """Запуск приложения"""
+        self.window.mainloop()
 
-def darken_color(self, color, percent):
-    """Затемняет цвет на указанный процент"""
-    if isinstance(color, str) and color.startswith('#'):
-        rgb = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
-        darkened = tuple(max(0, int(c * (100 - percent) / 100)) for c in rgb)
-        return f'#{darkened[0]:02x}{darkened[1]:02x}{darkened[2]:02x}'
-    return color
 
-def add_card_hover_effect(self, card_frame, inner_frame, button, role):
-    """Добавляет эффект наведения на карточку"""
-    original_bg = self.get_button_color(role)
-    darkened_bg = self.darken_color(original_bg, 15)
-    
-    def on_enter(e):
-        card_frame.config(bg=darkened_bg)
-        button.config(bg=darkened_bg)
-    
-    def on_leave(e):
-        card_frame.config(bg=original_bg)
-        button.config(bg=original_bg)
-    
-    # Привязываем события ко всем виджетам внутри карточки
-    for widget in [card_frame, inner_frame, button]:
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)    
 # Запуск приложения
 if __name__ == "__main__":
     try:
         app = EnhancedLoginWindow()
-        # Просто вызываем метод mainloop напрямую
-        app.window.mainloop()
+        app.run()
     except Exception as e:
         print(f"Ошибка запуска приложения: {e}")
         messagebox.showerror("Ошибка", f"Не удалось запустить приложение:\n{str(e)}")
